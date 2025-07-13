@@ -1,0 +1,244 @@
+#!/usr/bin/expect -f
+
+set timeout 20
+log_file -a forti_script.log
+
+# --- VLANs to configure ---
+set all_vlans {100 101 200 201 202 203 300 301 457 458 601 699 801 804 808 810 815 827 847 900}
+array set vlan_subnet {}
+array set vlan_internet {}
+set active_vlans {}
+
+proc zero_last_octet {ip_cidr} {
+    regexp {(\d+)\.(\d+)\.(\d+)\.(\d+)/(\d+)} $ip_cidr -> o1 o2 o3 o4 mask
+    return "${o1}.${o2}.${o3}.0/$mask"
+}
+
+proc to_subnet_mask {ip_cidr} {
+    regexp {\d+/(\d+)} $ip_cidr -> prefixlen
+    set mask [expr {0xffffffff << (32 - $prefixlen) & 0xffffffff}]
+    set m1 [expr {($mask >> 24) & 0xff}]
+    set m2 [expr {($mask >> 16) & 0xff}]
+    set m3 [expr {($mask >> 8) & 0xff}]
+    set m4 [expr {$mask & 0xff}]
+    return "$m1.$m2.$m3.$m4"
+}
+
+# --- Get user input ---
+send_user "FortiGate IP: "
+expect_user -re "(.*)\n"
+set fgt_ip $expect_out(1,string)
+
+send_user "Username: "
+expect_user -re "(.*)\n"
+set username $expect_out(1,string)
+
+send_user "Password: "
+stty -echo
+expect_user -re "(.*)\n"
+stty echo
+send_user "\n"
+set password $expect_out(1,string)
+
+# --- User selects VLANs ---
+foreach vlan $all_vlans {
+    send_user "Configure VLAN $vlan? (Y/N): "
+    expect_user -re "(.*)\n"
+    set answer [string tolower $expect_out(1,string)]
+
+    if {$answer eq "y"} {
+        lappend active_vlans $vlan
+        send_user "Enter IP/Subnet for VLAN $vlan (e.g., 172.16.$vlan.1/24): "
+        expect_user -re "(.*)\n"
+        set ip_raw $expect_out(1,string)
+        set vlan_subnet($vlan) $ip_raw
+
+        send_user "Does VLAN $vlan require internet access? (Y/N): "
+        expect_user -re "(.*)\n"
+        set netanswer [string tolower $expect_out(1,string)]
+        set vlan_internet($vlan) [expr {$netanswer eq "y" ? 1 : 0}]
+    }
+}
+
+# --- SSH Login ---
+spawn ssh $username@$fgt_ip
+expect {
+    -re "Are you sure you want to continue connecting.*" {
+        send "yes\r"
+        exp_continue
+    }
+    -re "(?i)password:" {
+        send "$password\r"
+        exp_continue
+    }
+    -re ".*# $" {
+        # Login OK
+    }
+    timeout {
+        send_user "Login timed out or failed.\n"
+        exit 1
+    }
+    eof {
+        send_user "SSH connection closed unexpectedly.\n"
+        exit 1
+    }
+}
+
+# --- Create VLANs (interface + address + internet policy) sequentially ---
+foreach vlan $active_vlans {
+    set iface_name "VLAN$vlan"
+    set ip $vlan_subnet($vlan)
+
+    # --- Interface ---
+    send "config system interface\r"
+    expect "#"
+    send "edit \"$iface_name\"\r"
+    expect "#"
+    send "set vdom root\r"
+    expect "#"
+    send "set type vlan\r"
+    expect "#"
+    send "set interface port2\r"
+    expect "#"
+    send "set vlanid $vlan\r"
+    expect "#"
+    send "set ip $ip\r"
+    expect "#"
+    send "set status enable\r"
+    expect "#"
+    send "next\r"
+    expect "#"
+    send "end\r"
+    expect "#"
+
+    # --- Address object ---
+    set subnet [zero_last_octet $ip]
+    set mask [to_subnet_mask $ip]
+    regexp {(\d+\.\d+\.\d+\.\d+)/} $subnet -> subnet_ip
+    set addr_name "VLAN${vlan}_Subnet"
+
+    send "config firewall address\r"
+    expect "#"
+    send "edit \"$addr_name\"\r"
+    expect "#"
+    send "set subnet $subnet_ip $mask\r"
+    expect "#"
+    send "set associated-interface \"$iface_name\"\r"
+    expect "#"
+    send "next\r"
+    expect "#"
+    send "end\r"
+    expect "#"
+
+    # --- Internet access policy if needed ---
+    if {$vlan_internet($vlan)} {
+        set pol_name "internet-vlan$vlan"
+
+        send "config firewall policy\r"
+        expect "#"
+        send "edit 0\r"
+        expect "#"
+        send "set name \"$pol_name\"\r"
+        expect "#"
+        send "set srcintf \"$iface_name\"\r"
+        expect "#"
+        send "set dstintf \"wan1\"\r"
+        expect "#"
+        send "set srcaddr all\r"
+        expect "#"
+        send "set dstaddr all\r"
+        expect "#"
+        send "set action accept\r"
+        expect "#"
+        send "set schedule always\r"
+        expect "#"
+        send "set service ALL\r"
+        expect "#"
+        send "set nat enable\r"
+        expect "#"
+        send "set status enable\r"
+        expect "#"
+        send "next\r"
+        expect "#"
+        send "end\r"
+        expect "#"
+    }
+}
+
+# --- Inter-VLAN policies (after all VLANs are ready) ---
+set policy_pairs {
+    {100 900} {900 100}
+    {100 101} {101 100}
+    {457 900} {900 457}
+    {458 900} {900 458}
+    {601 699} {699 601}
+    {699 900} {900 699}
+    {801 900} {900 801}
+    {804 900} {900 804}
+    {808 900} {900 808}
+    {810 900} {900 810}
+    {200 900} {900 200}
+    {201 900} {900 201}
+    {202 900} {900 202}
+    {203 900} {900 203}
+    {300 900} {900 300}
+    {301 900} {900 301}
+    {815 900} {900 815}
+    {827 900} {900 827}
+    {847 900} {900 847}
+    {200 201} {201 200}
+    {200 203} {203 200}
+    {200 300} {300 200}
+    {201 300} {300 201}
+    {201 301} {301 201}
+    {203 301} {301 203}
+    {203 201} {201 203}
+    {203 300} {300 203}
+    {300 301} {301 300}
+    {699 200} {200 699}
+    {601 699} {699 601}
+}
+
+send "config firewall policy\r"
+expect "#"
+foreach pair $policy_pairs {
+    lassign $pair src dst
+    if {[lsearch -exact $active_vlans $src] == -1 || [lsearch -exact $active_vlans $dst] == -1} {
+        continue
+    }
+
+    set src_if "VLAN$src"
+    set dst_if "VLAN$dst"
+    set src_addr "VLAN${src}_Subnet"
+    set dst_addr "VLAN${dst}_Subnet"
+    set pol_name "${src}-${dst}"
+
+    send "edit 0\r"
+    expect "#"
+    send "set name \"$pol_name\"\r"
+    expect "#"
+    send "set srcintf \"$src_if\"\r"
+    expect "#"
+    send "set dstintf \"$dst_if\"\r"
+    expect "#"
+    send "set srcaddr \"$src_addr\"\r"
+    expect "#"
+    send "set dstaddr \"$dst_addr\"\r"
+    expect "#"
+    send "set action accept\r"
+    expect "#"
+    send "set schedule always\r"
+    expect "#"
+    send "set service ALL\r"
+    expect "#"
+    send "set status enable\r"
+    expect "#"
+    send "next\r"
+    expect "#"
+}
+send "end\r"
+expect "#"
+
+# --- Exit ---
+send "exit\r"
+expect eof
