@@ -1,0 +1,245 @@
+#!/usr/bin/expect -f
+
+set timeout 20
+log_file -a forti_script.log
+
+# --- VLAN suffix mapping ---
+array set vlan_suffix {
+    100 SWMGMT
+    101 APMGMT
+    200 MI_PCI_Servers
+    201 MI_NPCI_Servers
+    202 Server_MGMT
+    203 POS
+    300 BOH_Assc_Wired
+    301 BOH_Assc_Device
+    457 SILK
+    458 eReg
+    601 VOIP
+    699 PABX
+    801 DEV
+    804 PMS_Heatbeat
+    808 RControll
+    810 DigtalSgn
+    815 ATM_Machines
+    827 Credit_Card
+    847 KeyCard
+    900 GPNS_Connector
+}
+
+set all_vlans {100 101 200 201 202 203 300 301 457 458 601 699 801 804 808 810 815 827 847 900}
+array set vlan_subnet {}
+array set vlan_internet {}
+set active_vlans {}
+
+# --- Safe 15-char object name generator ---
+proc get_safe_name {vlan suffix} {
+    set base "V$vlan"
+    set remaining [expr {15 - [string length $base] - 1}]
+    set short_suffix [string range $suffix 0 $remaining]
+    return "${base}_$short_suffix"
+}
+
+proc zero_last_octet {ip_cidr} {
+    regexp {(\d+)\.(\d+)\.(\d+)\.(\d+)/(\d+)} $ip_cidr -> o1 o2 o3 o4 mask
+    return "${o1}.${o2}.${o3}.0/$mask"
+}
+
+proc to_subnet_mask {ip_cidr} {
+    regexp {\d+/(\d+)} $ip_cidr -> prefixlen
+    set mask [expr {0xffffffff << (32 - $prefixlen) & 0xffffffff}]
+    set m1 [expr {($mask >> 24) & 0xff}]
+    set m2 [expr {($mask >> 16) & 0xff}]
+    set m3 [expr {($mask >> 8) & 0xff}]
+    set m4 [expr {$mask & 0xff}]
+    return "$m1.$m2.$m3.$m4"
+}
+
+# --- Get user input ---
+send_user "FortiGate IP: "
+expect_user -re "(.*)\n"
+set fgt_ip $expect_out(1,string)
+
+send_user "Username: "
+expect_user -re "(.*)\n"
+set username $expect_out(1,string)
+
+send_user "Password: "
+stty -echo
+expect_user -re "(.*)\n"
+stty echo
+send_user "\n"
+set password $expect_out(1,string)
+
+foreach vlan $all_vlans {
+    send_user "Configure VLAN $vlan ($vlan_suffix($vlan))? (Y/N): "
+    expect_user -re "(.*)\n"
+    set answer [string tolower $expect_out(1,string)]
+
+    if {$answer eq "y"} {
+        lappend active_vlans $vlan
+        send_user "Enter IP/Subnet for VLAN $vlan (e.g., 172.16.$vlan.1/24): "
+        expect_user -re "(.*)\n"
+        set ip_raw $expect_out(1,string)
+        set vlan_subnet($vlan) $ip_raw
+
+        send_user "Does VLAN $vlan require internet access? (Y/N): "
+        expect_user -re "(.*)\n"
+        set netanswer [string tolower $expect_out(1,string)]
+        set vlan_internet($vlan) [expr {$netanswer eq "y" ? 1 : 0}]
+    }
+}
+
+# --- SSH Login ---
+spawn ssh $username@$fgt_ip
+expect {
+    -re "Are you sure you want to continue connecting.*" {
+        send "yes\r"
+        exp_continue
+    }
+    -re "(?i)password:" {
+        send "$password\r"
+        exp_continue
+    }
+    -re ".*# $" {
+        # Successfully logged in
+    }
+    timeout {
+        send_user "Login timed out or failed.\n"
+        exit 1
+    }
+    eof {
+        send_user "SSH connection closed unexpectedly.\n"
+        exit 1
+    }
+}
+
+# --- VLAN Interface Configuration ---
+send "config system interface\r"
+foreach vlan $active_vlans {
+    set suffix $vlan_suffix($vlan)
+    set iface_name [get_safe_name $vlan $suffix]
+    set ip $vlan_subnet($vlan)
+
+    send "edit \"$iface_name\"\r"
+    send "set vdom root\r"
+    send "set type vlan\r"
+    send "set interface port2\r"
+    send "set vlanid $vlan\r"
+    send "set ip $ip\r"
+    send "next\r"
+}
+send "end\r"
+expect "#"
+
+# --- Address Objects ---
+send "config firewall address\r"
+foreach vlan $active_vlans {
+    set suffix $vlan_suffix($vlan)
+    set iface_name [get_safe_name $vlan $suffix]
+
+    set ip_raw $vlan_subnet($vlan)
+    set subnet [zero_last_octet $ip_raw]
+    set mask [to_subnet_mask $ip_raw]
+    regexp {(\d+\.\d+\.\d+\.\d+)/} $subnet -> subnet_ip
+
+    set addr_name "VLAN${vlan}_Subnet"
+    set addr_name [string range $addr_name 0 14]
+
+    send "edit \"$addr_name\"\r"
+    send "set subnet $subnet_ip $mask\r"
+    send "set associated-interface \"$iface_name\"\r"
+    send "next\r"
+}
+send "end\r"
+expect "#"
+
+# --- Define Allowed Policy Pairs ---
+set policy_pairs {
+    {100 900} {900 100}
+    {100 101} {101 100}
+    {457 900} {900 457}
+    {458 900} {900 458}
+    {601 699} {699 601}
+    {699 900} {900 699}
+    {801 900} {900 801}
+    {804 900} {900 804}
+    {808 900} {900 808}
+    {810 900} {900 810}
+    {200 900} {900 200}
+    {201 900} {900 201}
+    {202 900} {900 202}
+    {203 900} {900 203}
+    {300 900} {900 300}
+    {301 900} {900 301}
+    {815 900} {900 815}
+    {827 900} {900 827}
+    {847 900} {900 847}
+    {200 201} {201 200}
+    {200 203} {203 200}
+    {200 300} {300 200}
+    {201 300} {300 201}
+    {201 301} {301 201}
+    {203 301} {301 203}
+    {203 201} {201 203}
+    {203 300} {300 203}
+    {300 301} {301 300}
+    {699 200} {200 699}
+    {601 699} {699 601}
+}
+
+# --- Inter-VLAN Policies ---
+send "config firewall policy\r"
+foreach pair $policy_pairs {
+    lassign $pair src dst
+    if {[lsearch -exact $active_vlans $src] == -1 || [lsearch -exact $active_vlans $dst] == -1} {
+        continue
+    }
+
+    set src_if [get_safe_name $src $vlan_suffix($src)]
+    set dst_if [get_safe_name $dst $vlan_suffix($dst)]
+    set src_addr [string range "VLAN${src}_Subnet" 0 14]
+    set dst_addr [string range "VLAN${dst}_Subnet" 0 14]
+
+    set pol_name "${src}-${dst}"
+
+    send "edit 0\r"
+    send "set name \"$pol_name\"\r"
+    send "set srcintf \"$src_if\"\r"
+    send "set dstintf \"$dst_if\"\r"
+    send "set srcaddr \"$src_addr\"\r"
+    send "set dstaddr \"$dst_addr\"\r"
+    send "set action accept\r"
+    send "set schedule always\r"
+    send "set service ALL\r"
+    send "next\r"
+}
+send "end\r"
+expect "#"
+
+# --- Internet Access Policies (with NAT) ---
+send "config firewall policy\r"
+foreach vlan $active_vlans {
+    if {$vlan_internet($vlan)} {
+        set iface_name [get_safe_name $vlan $vlan_suffix($vlan)]
+        set name "internet-vlan$vlan"
+
+        send "edit 0\r"
+        send "set name \"$name\"\r"
+        send "set srcintf \"$iface_name\"\r"
+        send "set dstintf \"wan1\"\r"
+        send "set srcaddr all\r"
+        send "set dstaddr all\r"
+        send "set action accept\r"
+        send "set schedule always\r"
+        send "set service ALL\r"
+        send "set nat enable\r"
+        send "next\r"
+    }
+}
+send "end\r"
+expect "#"
+
+# --- Exit session ---
+send "exit\r"
+expect eof
